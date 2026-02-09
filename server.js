@@ -10,92 +10,79 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-/* =========================
-   Routes publiques (évite 404/401 navigateur)
-========================= */
+// ✅ Routes publiques (évite les 404/401 du navigateur)
 app.get("/", (req, res) => {
   res.status(200).send("✅ EventManager Backend is running");
 });
+
 app.get("/favicon.ico", (req, res) => res.status(204).end());
 
-// Health check PUBLIC (pas de token)
-app.get("/api/health", (req, res) => {
-  res.json({ status: "OK", timestamp: new Date().toISOString() });
-});
+// ✅ Connexion Airtable
+const base = new Airtable({ apiKey: process.env.AIRTABLE_TOKEN }).base(
+  process.env.AIRTABLE_BASE_ID
+);
 
-/* =========================
-   Airtable init + checks
-========================= */
-function assertEnv(name) {
-  if (!process.env[name]) {
-    console.error(`❌ Missing env var: ${name}`);
-    return false;
-  }
-  return true;
-}
-
-const hasAirtableEnv =
-  assertEnv("AIRTABLE_TOKEN") && assertEnv("AIRTABLE_BASE_ID");
-const hasJwtEnv = assertEnv("JWT_SECRET");
-
-// Connexion Airtable
-const base = hasAirtableEnv
-  ? new Airtable({ apiKey: process.env.AIRTABLE_TOKEN }).base(
-      process.env.AIRTABLE_BASE_ID
-    )
-  : null;
-
-/* =========================
-   Auth middleware
-========================= */
+// ✅ Middleware auth (token + gestion expiration)
 const verifyToken = (req, res, next) => {
-  const token = req.headers.authorization?.split(" ")[1];
-  if (!token) return res.status(401).json({ error: "Token manquant" });
+  const header = req.headers.authorization || "";
+  const token = header.startsWith("Bearer ") ? header.slice(7) : null;
+
+  if (!token) {
+    return res.status(401).json({ error: "Token manquant" });
+  }
 
   try {
-    if (!hasJwtEnv) {
-      return res.status(500).json({ error: "JWT_SECRET manquant côté serveur" });
-    }
-    req.user = jwt.verify(token, process.env.JWT_SECRET);
+    req.user = jwt.verify(token, process.env.JWT_SECRET); // vérifie signature + exp
     next();
-  } catch {
+  } catch (err) {
+    if (err?.name === "TokenExpiredError") {
+      return res.status(401).json({
+        error: "Token expiré",
+        expiredAt: err.expiredAt,
+      });
+    }
     return res.status(401).json({ error: "Token invalide" });
   }
 };
 
-/* =========================
-   Helper : rendre l'erreur Airtable lisible
-========================= */
-function formatAirtableError(error) {
-  // airtable lib renvoie souvent error.statusCode + error.error + error.message
-  return {
-    message: error?.message || "Unknown Airtable error",
-    statusCode: error?.statusCode,
-    name: error?.name,
-    // parfois: { error: { type, message } }
-    airtable: error?.error,
-  };
-}
+/**
+ * ✅ Sécurisation fine :
+ * Un admin ne peut accéder qu'à SON ASBL.
+ *
+ * - Ton JWT contient :
+ *   req.user.id     = record Airtable (rec...)
+ *   req.user.asblId = id métier (ex: ASBL001)
+ *
+ * Règle :
+ * - si tu demandes /api/asbl/:recId => le :recId DOIT être le même que req.user.id (admin)
+ * - si tu demandes /api/asbl/by-code/:code => le record trouvé DOIT avoir fields.id === req.user.asblId
+ */
+const authorizeAdminAsblRecordId = (req, res, next) => {
+  if (req.user?.type !== "admin") {
+    return res.status(403).json({ error: "Accès réservé admin" });
+  }
+  if (req.params.id !== req.user.id) {
+    return res.status(403).json({ error: "Accès interdit à une autre ASBL" });
+  }
+  next();
+};
 
-/* =========================
-   Routes API
-========================= */
+const authorizeAdminAsblByCode = (asblRecordFields, req, res) => {
+  if (req.user?.type !== "admin") {
+    return res.status(403).json({ error: "Accès réservé admin" });
+  }
+  if (asblRecordFields?.id !== req.user.asblId) {
+    return res.status(403).json({ error: "Accès interdit à une autre ASBL" });
+  }
+  return null; // ok
+};
 
-// LOGIN (public)
+// =====================
+// ROUTES API
+// =====================
+
 app.post("/api/auth/login", async (req, res) => {
-  const { code, type } = req.body || {};
-
-  if (!base) {
-    return res
-      .status(500)
-      .json({ error: "Airtable non configuré (env manquantes)" });
-  }
-  if (!hasJwtEnv) {
-    return res.status(500).json({ error: "JWT_SECRET manquant côté serveur" });
-  }
-  if (!code || !type) {
-    return res.status(400).json({ error: "code et type sont requis" });
-  }
+  const { code, type } = req.body;
 
   try {
     const table = type === "admin" ? "ASBL" : "Benevoles";
@@ -111,79 +98,76 @@ app.post("/api/auth/login", async (req, res) => {
 
     const record = records[0];
 
+    // ⚠️ IMPORTANT :
+    // - admin : record.id = rec... de la table ASBL (parfait)
+    // - admin : record.fields.id = "ASBL001" (id métier)
+    // => on met les deux dans le JWT
     const token = jwt.sign(
-      { id: record.id, type, asblId: record.fields.id }, // record.id = recXXXX
+      { id: record.id, type, asblId: record.fields.id },
       process.env.JWT_SECRET,
       { expiresIn: "8h" }
     );
 
     res.json({ token, user: record.fields });
   } catch (error) {
-    console.error("❌ LOGIN ERROR:", formatAirtableError(error));
-    res.status(500).json({
-      error: "Erreur serveur",
-      details: formatAirtableError(error),
-    });
+    console.error("LOGIN ERROR:", error);
+    res.status(500).json({ error: "Erreur serveur" });
   }
 });
 
-// GET ASBL par record Airtable ID (protégé)
-app.get("/api/asbl/:id", verifyToken, async (req, res) => {
-  if (!base) {
-    return res
-      .status(500)
-      .json({ error: "Airtable non configuré (env manquantes)" });
-  }
-
+// ✅ Route protégée par record Airtable (rec...)
+// -> verrouillée : un admin ne peut demander QUE son propre rec...
+app.get("/api/asbl/:id", verifyToken, authorizeAdminAsblRecordId, async (req, res) => {
   try {
-    const record = await base("ASBL").find(req.params.id); // req.params.id doit être recXXXX
+    const record = await base("ASBL").find(req.params.id);
     res.json(record.fields);
   } catch (error) {
-    console.error("❌ /api/asbl/:id ERROR:", formatAirtableError(error));
+    console.error("AIRTABLE /api/asbl/:id ERROR:", error);
     res.status(500).json({
       error: "Erreur Airtable",
-      details: formatAirtableError(error),
+      details: error?.message || String(error),
     });
   }
 });
 
-// ✅ GET ASBL par code interne (protégé) : /api/asbl/by-code/ASBL001
-app.get("/api/asbl/by-code/:asblCode", verifyToken, async (req, res) => {
-  if (!base) {
-    return res
-      .status(500)
-      .json({ error: "Airtable non configuré (env manquantes)" });
-  }
-
-  const asblCode = req.params.asblCode;
-
+// ✅ Route protégée par "id métier" (ASBL001)
+// -> verrouillée : on compare fields.id à req.user.asblId
+app.get("/api/asbl/by-code/:code", verifyToken, async (req, res) => {
   try {
+    const code = req.params.code;
+
     const records = await base("ASBL")
-      .select({ filterByFormula: `{id} = '${asblCode}'` }) // champ "id" dans Airtable (ASBL001)
+      .select({ filterByFormula: `{id} = '${code}'` })
       .firstPage();
 
     if (!records.length) {
       return res.status(404).json({ error: "ASBL introuvable" });
     }
 
-    res.json(records[0].fields);
+    const record = records[0];
+
+    const forbidden = authorizeAdminAsblByCode(record.fields, req, res);
+    if (forbidden) return; // réponse déjà envoyée
+
+    res.json(record.fields);
   } catch (error) {
-    console.error("❌ /api/asbl/by-code ERROR:", formatAirtableError(error));
+    console.error("AIRTABLE /api/asbl/by-code ERROR:", error);
     res.status(500).json({
       error: "Erreur Airtable",
-      details: formatAirtableError(error),
+      details: error?.message || String(error),
     });
   }
 });
 
-/* =========================
-   Export Vercel
-========================= */
+// ✅ Health check public (sans token)
+app.get("/api/health", (req, res) => {
+  res.json({ status: "OK", timestamp: new Date().toISOString() });
+});
+
+// Export pour Vercel
 export default app;
 
-/* =========================
-   Local dev only
-========================= */
+// Test local uniquement
 if (process.env.NODE_ENV !== "production") {
   const PORT = process.env.PORT || 3000;
   app.listen(PORT, () => {

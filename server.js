@@ -10,25 +10,32 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-// ✅ Routes publiques (évite les 404/401 du navigateur)
+// ✅ Routes publiques (évite 404/401 du navigateur)
 app.get('/', (req, res) => {
   res.status(200).send('✅ EventManager Backend is running');
 });
 app.get('/favicon.ico', (req, res) => res.status(204).end());
 
+// ✅ Health check public (sans token)
+app.get('/api/health', (req, res) => {
+  res.json({ status: 'OK', timestamp: new Date().toISOString() });
+});
+
 // Connexion Airtable
 const base = new Airtable({ apiKey: process.env.AIRTABLE_TOKEN })
   .base(process.env.AIRTABLE_BASE_ID);
 
-// Middleware auth (gère expiré vs invalide)
+// Middleware auth (token)
 const verifyToken = (req, res, next) => {
-  const token = req.headers.authorization?.split(' ')[1];
+  const auth = req.headers.authorization || '';
+  const token = auth.startsWith('Bearer ') ? auth.slice(7) : null;
   if (!token) return res.status(401).json({ error: 'Token manquant' });
 
   try {
     req.user = jwt.verify(token, process.env.JWT_SECRET);
     next();
   } catch (err) {
+    // Token expiré => message clair
     if (err?.name === 'TokenExpiredError') {
       return res.status(401).json({ error: 'Token expiré' });
     }
@@ -36,23 +43,35 @@ const verifyToken = (req, res, next) => {
   }
 };
 
-// ✅ Sécurisation fine: l'admin ne peut accéder qu'à SON ASBL
-const requireSameAsbl = (req, res, asblCodeRequested) => {
-  // Ici: route réservée aux admins. (Tu pourras étendre aux bénévoles plus tard)
+// --- Helpers sécurité ---
+// Un admin ne peut accéder qu'à SON ASBL
+function authorizeAdminAsblRecordId(requestedRecordId, req, res) {
   if (req.user?.type !== 'admin') {
-    res.status(403).json({ error: 'Accès interdit (admin uniquement)' });
+    res.status(403).json({ error: "Accès refusé (admin uniquement)" });
     return true;
   }
-
-  if (req.user.asblId !== asblCodeRequested) {
-    res.status(403).json({ error: 'Accès interdit (ASBL mismatch)' });
+  if (requestedRecordId !== req.user.id) {
+    res.status(403).json({ error: "Accès refusé (ASBL non autorisée)" });
     return true;
   }
-
   return false;
-};
+}
 
-// Routes API
+function authorizeAdminAsblByCode(asblFields, req, res) {
+  if (req.user?.type !== 'admin') {
+    res.status(403).json({ error: "Accès refusé (admin uniquement)" });
+    return true;
+  }
+  // asblFields.id = "ASBL001" dans ton Airtable
+  if (asblFields?.id !== req.user.asblId) {
+    res.status(403).json({ error: "Accès refusé (ASBL non autorisée)" });
+    return true;
+  }
+  return false;
+}
+
+// --- Routes API ---
+// Login
 app.post('/api/auth/login', async (req, res) => {
   const { code, type } = req.body;
 
@@ -70,9 +89,9 @@ app.post('/api/auth/login', async (req, res) => {
 
     const record = records[0];
 
-    // IMPORTANT :
-    // - record.id = Airtable Record ID (rec...)
-    // - record.fields.id = ton code ASBL (ex: ASBL001)
+    // ✅ Payload :
+    // - id = Airtable recordId (rec...)
+    // - asblId = ton identifiant métier (ASBL001) (dans record.fields.id côté ASBL)
     const token = jwt.sign(
       { id: record.id, type, asblId: record.fields.id },
       process.env.JWT_SECRET,
@@ -82,13 +101,19 @@ app.post('/api/auth/login', async (req, res) => {
     res.json({ token, user: record.fields });
   } catch (error) {
     console.error('LOGIN ERROR:', error);
-    res.status(500).json({ error: 'Erreur serveur' });
+    res.status(500).json({
+      error: 'Erreur serveur',
+      details: error?.message || String(error),
+    });
   }
 });
 
-// Route protégée: fetch ASBL par Airtable Record ID (rec...)
+// 🔒 Lire une ASBL par Airtable recordId (rec...)
 app.get('/api/asbl/:id', verifyToken, async (req, res) => {
   try {
+    const forbidden = authorizeAdminAsblRecordId(req.params.id, req, res);
+    if (forbidden) return;
+
     const record = await base('ASBL').find(req.params.id);
     res.json(record.fields);
   } catch (error) {
@@ -100,13 +125,10 @@ app.get('/api/asbl/:id', verifyToken, async (req, res) => {
   }
 });
 
-// ✅ Nouvelle route protégée: fetch ASBL par code (ASBL001)
-// + sécurisation: l'admin ne peut demander que son propre code
+// 🔒 Lire une ASBL par code "ASBL001" (champ {id} dans Airtable)
 app.get('/api/asbl/by-code/:code', verifyToken, async (req, res) => {
   try {
     const code = req.params.code;
-
-    if (requireSameAsbl(req, res, code)) return;
 
     const records = await base('ASBL')
       .select({ filterByFormula: `{id} = '${code}'` })
@@ -116,7 +138,12 @@ app.get('/api/asbl/by-code/:code', verifyToken, async (req, res) => {
       return res.status(404).json({ error: 'ASBL introuvable' });
     }
 
-    res.json(records[0].fields);
+    const record = records[0];
+
+    const forbidden = authorizeAdminAsblByCode(record.fields, req, res);
+    if (forbidden) return;
+
+    res.json(record.fields);
   } catch (error) {
     console.error('AIRTABLE /api/asbl/by-code ERROR:', error);
     res.status(500).json({
@@ -124,11 +151,6 @@ app.get('/api/asbl/by-code/:code', verifyToken, async (req, res) => {
       details: error?.message || String(error),
     });
   }
-});
-
-// Health check public (sans token)
-app.get('/api/health', (req, res) => {
-  res.json({ status: 'OK', timestamp: new Date().toISOString() });
 });
 
 // Export pour Vercel

@@ -1,4 +1,3 @@
-
 import express from 'express';
 import cors from 'cors';
 import Airtable from 'airtable';
@@ -66,11 +65,36 @@ app.post('/api/auth/login', async (req, res) => {
   }
 });
 
+// ✅ Route "technique" : récupérer une ASBL via l'ID Airtable (rec...)
 app.get('/api/asbl/:id', verifyToken, async (req, res) => {
   try {
     const record = await base('ASBL').find(req.params.id);
     res.json(record.fields);
   } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: 'Erreur Airtable' });
+  }
+});
+
+// ✅ Route "métier" : récupérer une ASBL via son ID interne (ex: ASBL001)
+app.get('/api/asbl/by-code/:code', verifyToken, async (req, res) => {
+  try {
+    const code = req.params.code;
+
+    const records = await base('ASBL')
+      .select({
+        maxRecords: 1,
+        filterByFormula: `{id} = '${code}'`
+      })
+      .firstPage();
+
+    if (!records || records.length === 0) {
+      return res.status(404).json({ error: 'ASBL introuvable' });
+    }
+
+    res.json(records[0].fields);
+  } catch (error) {
+    console.error(error);
     res.status(500).json({ error: 'Erreur Airtable' });
   }
 });

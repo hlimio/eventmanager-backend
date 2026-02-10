@@ -154,16 +154,35 @@ app.post('/api/auth/login', async (req, res) => {
     // ✅ token standardisé
     // id = recordId Airtable (rec...)
     // asblId = code métier "ASBL001"
-    const token = jwt.sign(
-      { id: record.id, type, asblId },
-      process.env.JWT_SECRET,
-      { expiresIn: '8h' }
-    );
+    const token = jwt.sign({ id: record.id, type, asblId }, process.env.JWT_SECRET, { expiresIn: '8h' });
 
     res.json({ token, user: record.fields });
   } catch (error) {
     console.error('LOGIN ERROR:', error);
     res.status(500).json({ error: 'Erreur serveur', details: error?.message || String(error) });
+  }
+});
+
+/* ------------------------------------------------------------------ */
+/* ✅ AJOUTS IMPORTANT : /api/auth/me + /api/benevoles/me              */
+/* ------------------------------------------------------------------ */
+
+// ✅ Permet au front de vérifier le token (corrige ton 404 /api/auth/me)
+app.get('/api/auth/me', verifyToken, async (req, res) => {
+  try {
+    res.json({ user: req.user });
+  } catch (e) {
+    res.status(500).json({ error: 'Erreur /api/auth/me' });
+  }
+});
+
+// ✅ Infos du bénévole connecté (évite que le front appelle une route admin-only)
+app.get('/api/benevoles/me', verifyToken, requireRole(['benevole']), async (req, res) => {
+  try {
+    const record = await base('Benevoles').find(req.user.id); // req.user.id = recordId Airtable
+    res.json({ recordId: record.id, ...record.fields });
+  } catch (e) {
+    res.status(500).json({ error: 'Erreur /api/benevoles/me', details: e?.message || String(e) });
   }
 });
 
@@ -186,18 +205,7 @@ app.get('/api/asbl', verifyToken, requireRole(['superadmin']), async (req, res) 
 // ✅ Créer ASBL (superadmin) -> écrit dans Airtable
 app.post('/api/asbl', verifyToken, requireRole(['superadmin']), async (req, res) => {
   try {
-    const {
-      id,
-      nom,
-      email,
-      telephone,
-      adminNom,
-      adminPrenom,
-      adminEmail,
-      codeAdmin,
-      actif,
-      dateCreation,
-    } = req.body || {};
+    const { id, nom, email, telephone, adminNom, adminPrenom, adminEmail, codeAdmin, actif, dateCreation } = req.body || {};
 
     if (!id || !nom || !email || !codeAdmin) {
       return res.status(400).json({ error: "Champs requis: id, nom, email, codeAdmin" });
@@ -235,14 +243,12 @@ app.post('/api/asbl', verifyToken, requireRole(['superadmin']), async (req, res)
 app.get('/api/asbl/:recordId', verifyToken, requireRole(['admin', 'superadmin']), async (req, res) => {
   try {
     const record = await base('ASBL').find(req.params.recordId);
-    const asblCode = record?.fields?.id;
 
     // admin ne peut lire que son recordId (option stricte)
     if (req.user.type === 'admin' && req.user.id !== req.params.recordId) {
       return res.status(403).json({ error: 'Accès refusé (ASBL non autorisée)' });
     }
 
-    // superadmin ok
     res.json({ recordId: record.id, ...record.fields });
   } catch (error) {
     console.error('GET /api/asbl/:recordId ERROR:', error);
@@ -281,8 +287,6 @@ app.get('/api/benevoles/by-asbl/:asblCode', verifyToken, requireRole(['admin', '
       return res.status(403).json({ error: 'Accès refusé (ASBL non autorisée)' });
     }
 
-    // Filtre Airtable: priorité au champ texte asblId
-    // Si tu utilises un linked-record "asbl", garde aussi le champ texte asblId pour filtrer facilement.
     const records = await base('Benevoles')
       .select({ filterByFormula: `{asblId} = '${asblCode}'`, maxRecords: 500 })
       .firstPage();
@@ -296,8 +300,6 @@ app.get('/api/benevoles/by-asbl/:asblCode', verifyToken, requireRole(['admin', '
 });
 
 // ✅ Créer un bénévole (admin/superadmin) -> écrit dans Airtable
-// - admin : le backend force asblId = req.user.asblId
-// - superadmin : doit fournir asblId
 app.post('/api/benevoles', verifyToken, requireRole(['admin', 'superadmin']), async (req, res) => {
   try {
     const { nom, prenom, telephone, email, codeAcces, role, tablesGerees, asblId } = req.body || {};
@@ -312,11 +314,9 @@ app.post('/api/benevoles', verifyToken, requireRole(['admin', 'superadmin']), as
       return res.status(400).json({ error: "asblId requis pour créer un bénévole (superadmin)" });
     }
 
-    // (Optionnel mais recommandé) vérifier que l’ASBL existe
     const asblRecord = await findAsblByBusinessId(finalAsblId);
     if (!asblRecord) return res.status(404).json({ error: `ASBL ${finalAsblId} introuvable` });
 
-    // unicité codeAcces
     const existing = await base('Benevoles')
       .select({ filterByFormula: `{codeAcces} = '${codeAcces}'`, maxRecords: 1 })
       .firstPage();
@@ -332,7 +332,7 @@ app.post('/api/benevoles', verifyToken, requireRole(['admin', 'superadmin']), as
           codeAcces,
           role: role || 'both',
           tablesGerees: Array.isArray(tablesGerees) ? tablesGerees : [],
-          asblId: finalAsblId, // ✅ champ texte recommandé
+          asblId: finalAsblId,
           // Si tu veux aussi remplir un champ linked-record 'asbl' :
           // asbl: [asblRecord.id],
         },
@@ -343,6 +343,29 @@ app.post('/api/benevoles', verifyToken, requireRole(['admin', 'superadmin']), as
   } catch (error) {
     console.error('POST /api/benevoles ERROR:', error);
     res.status(500).json({ error: 'Erreur Airtable', details: error?.message || String(error) });
+  }
+});
+
+/* ------------------------------------------------------------------ */
+/* ✅ AJOUT : Réservations (admin/superadmin)                          */
+/* ------------------------------------------------------------------ */
+
+app.get('/api/reservations/by-asbl/:asblCode', verifyToken, requireRole(['admin', 'superadmin']), async (req, res) => {
+  try {
+    const asblCode = req.params.asblCode;
+
+    if (req.user.type === 'admin' && req.user.asblId !== asblCode) {
+      return res.status(403).json({ error: 'Accès refusé (ASBL non autorisée)' });
+    }
+
+    const records = await base('Reservations')
+      .select({ filterByFormula: `{asblId} = '${asblCode}'`, maxRecords: 500 })
+      .firstPage();
+
+    res.json(records.map((r) => ({ recordId: r.id, ...r.fields })));
+  } catch (e) {
+    console.error('GET /api/reservations/by-asbl ERROR:', e);
+    res.status(500).json({ error: 'Erreur réservations', details: e?.message || String(e) });
   }
 });
 

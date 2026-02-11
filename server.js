@@ -151,9 +151,6 @@ app.post('/api/auth/login', async (req, res) => {
       }
     }
 
-    // ✅ token standardisé
-    // id = recordId Airtable (rec...)
-    // asblId = code métier "ASBL001"
     const token = jwt.sign({ id: record.id, type, asblId }, process.env.JWT_SECRET, { expiresIn: '8h' });
 
     res.json({ token, user: record.fields });
@@ -167,7 +164,6 @@ app.post('/api/auth/login', async (req, res) => {
 /* ✅ AJOUTS IMPORTANT : /api/auth/me + /api/benevoles/me              */
 /* ------------------------------------------------------------------ */
 
-// ✅ Permet au front de vérifier le token (corrige ton 404 /api/auth/me)
 app.get('/api/auth/me', verifyToken, async (req, res) => {
   try {
     res.json({ user: req.user });
@@ -176,10 +172,9 @@ app.get('/api/auth/me', verifyToken, async (req, res) => {
   }
 });
 
-// ✅ Infos du bénévole connecté (évite que le front appelle une route admin-only)
 app.get('/api/benevoles/me', verifyToken, requireRole(['benevole']), async (req, res) => {
   try {
-    const record = await base('Benevoles').find(req.user.id); // req.user.id = recordId Airtable
+    const record = await base('Benevoles').find(req.user.id);
     res.json({ recordId: record.id, ...record.fields });
   } catch (e) {
     res.status(500).json({ error: 'Erreur /api/benevoles/me', details: e?.message || String(e) });
@@ -190,7 +185,6 @@ app.get('/api/benevoles/me', verifyToken, requireRole(['benevole']), async (req,
 /* ASBL ROUTES                                                        */
 /* ------------------------------------------------------------------ */
 
-// ✅ Liste des ASBL (superadmin)
 app.get('/api/asbl', verifyToken, requireRole(['superadmin']), async (req, res) => {
   try {
     const records = await base('ASBL').select({ maxRecords: 500 }).firstPage();
@@ -202,7 +196,6 @@ app.get('/api/asbl', verifyToken, requireRole(['superadmin']), async (req, res) 
   }
 });
 
-// ✅ Créer ASBL (superadmin) -> écrit dans Airtable
 app.post('/api/asbl', verifyToken, requireRole(['superadmin']), async (req, res) => {
   try {
     const { id, nom, email, telephone, adminNom, adminPrenom, adminEmail, codeAdmin, actif, dateCreation } = req.body || {};
@@ -211,7 +204,6 @@ app.post('/api/asbl', verifyToken, requireRole(['superadmin']), async (req, res)
       return res.status(400).json({ error: "Champs requis: id, nom, email, codeAdmin" });
     }
 
-    // Vérifie unicité id métier (ASBL001)
     const existing = await findAsblByBusinessId(id);
     if (existing) return res.status(409).json({ error: `ASBL ${id} existe déjà` });
 
@@ -239,12 +231,10 @@ app.post('/api/asbl', verifyToken, requireRole(['superadmin']), async (req, res)
   }
 });
 
-// 🔒 Lire une ASBL par recordId Airtable (admin/superadmin)
 app.get('/api/asbl/:recordId', verifyToken, requireRole(['admin', 'superadmin']), async (req, res) => {
   try {
     const record = await base('ASBL').find(req.params.recordId);
 
-    // admin ne peut lire que son recordId (option stricte)
     if (req.user.type === 'admin' && req.user.id !== req.params.recordId) {
       return res.status(403).json({ error: 'Accès refusé (ASBL non autorisée)' });
     }
@@ -256,7 +246,6 @@ app.get('/api/asbl/:recordId', verifyToken, requireRole(['admin', 'superadmin'])
   }
 });
 
-// 🔒 Lire ASBL par code métier "ASBL001" (admin/benevole/superadmin)
 app.get('/api/asbl/by-code/:code', verifyToken, requireRole(['admin', 'benevole', 'superadmin']), async (req, res) => {
   try {
     const code = req.params.code;
@@ -278,7 +267,6 @@ app.get('/api/asbl/by-code/:code', verifyToken, requireRole(['admin', 'benevole'
 /* BENEVOLES ROUTES                                                   */
 /* ------------------------------------------------------------------ */
 
-// ✅ Lister benevoles d'une ASBL (admin/superadmin)
 app.get('/api/benevoles/by-asbl/:asblCode', verifyToken, requireRole(['admin', 'superadmin']), async (req, res) => {
   try {
     const asblCode = req.params.asblCode;
@@ -299,7 +287,6 @@ app.get('/api/benevoles/by-asbl/:asblCode', verifyToken, requireRole(['admin', '
   }
 });
 
-// ✅ Créer un bénévole (admin/superadmin) -> écrit dans Airtable
 app.post('/api/benevoles', verifyToken, requireRole(['admin', 'superadmin']), async (req, res) => {
   try {
     const { nom, prenom, telephone, email, codeAcces, role, tablesGerees, asblId } = req.body || {};
@@ -333,16 +320,25 @@ app.post('/api/benevoles', verifyToken, requireRole(['admin', 'superadmin']), as
           role: role || 'both',
           tablesGerees: Array.isArray(tablesGerees) ? tablesGerees : [],
           asblId: finalAsblId,
-          // Si tu veux aussi remplir un champ linked-record 'asbl' :
-          // asbl: [asblRecord.id],
+          // asbl: [asblRecord.id], // optionnel si tu as un champ linked-record
         },
       },
     ]);
 
     res.json({ recordId: created[0].id, ...created[0].fields });
   } catch (error) {
-    console.error('POST /api/benevoles ERROR:', error);
-    res.status(500).json({ error: 'Erreur Airtable', details: error?.message || String(error) });
+    // ✅ IMPORTANT : on renvoie l’erreur Airtable complète (pour voir EXACTEMENT pourquoi ça échoue)
+    console.error('POST /api/benevoles ERROR FULL:', error);
+
+    return res.status(500).json({
+      error: 'Erreur Airtable',
+      details: error?.message || String(error),
+      airtable: {
+        name: error?.name,
+        statusCode: error?.statusCode,
+        error: error?.error,
+      },
+    });
   }
 });
 

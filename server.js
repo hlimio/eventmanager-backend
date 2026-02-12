@@ -15,6 +15,7 @@ app.use(express.json());
 /* ------------------------------------------------------------------ */
 app.get('/', (req, res) => res.status(200).send('✅ EventManager Backend is running'));
 app.get('/favicon.ico', (req, res) => res.status(204).end());
+app.get('/favicon.png', (req, res) => res.status(204).end()); // ✅ évite le 404 dans les logs Vercel
 
 app.get('/api/health', (req, res) => {
   res.json({ status: 'OK', timestamp: new Date().toISOString() });
@@ -80,7 +81,6 @@ async function getAsblCodeFromBenevoleRecord(benevoleRecord) {
   if (typeof f.asblCode === 'string' && f.asblCode.trim()) return f.asblCode.trim();
 
   // 3) Cas linked record : champ "asbl" (array de recordIds)
-  // (tu peux aussi avoir "ASBL" selon comment tu l'as nommé)
   const linked = Array.isArray(f.asbl) ? f.asbl : Array.isArray(f.ASBL) ? f.ASBL : null;
   const asblRecordId = linked?.[0];
   if (!asblRecordId) return null;
@@ -91,35 +91,40 @@ async function getAsblCodeFromBenevoleRecord(benevoleRecord) {
 }
 
 function canAccessAsbl(asblCode, req) {
-  // superadmin : accès total
   if (req.user?.type === 'superadmin') return true;
-
-  // admin/benevole : uniquement leur ASBL
   return req.user?.asblId === asblCode;
 }
 
-/* ------------------------------------------------------------------ */
-/* ✅ NEW helpers : fetch records by Airtable recordIds                */
-/* ------------------------------------------------------------------ */
-async function fetchRecordsByIds(tableName, ids) {
-  const safeIds = Array.isArray(ids) ? ids.filter(Boolean) : [];
-  if (!safeIds.length) return [];
+/**
+ * ✅ Safe fetch: on récupère jusqu’à 500 records puis on filtre en JS.
+ * Ça évite de planter si le champ Airtable change de nom.
+ */
+async function fetchAll(tableName, maxRecords = 500) {
+  const records = await base(tableName).select({ maxRecords }).firstPage();
+  return records.map((r) => ({ recordId: r.id, ...r.fields }));
+}
 
-  // Airtable filterByFormula OR(RECORD_ID()='xxx', ...)
-  const chunks = [];
-  const chunkSize = 25; // évite les formules trop longues
-  for (let i = 0; i < safeIds.length; i += chunkSize) {
-    chunks.push(safeIds.slice(i, i + chunkSize));
-  }
+/**
+ * ✅ Détecte l’ASBL d’un record participant/réservation même si tes champs changent.
+ * - essaie asblId (texte)
+ * - essaie asblCode (texte)
+ * - essaie lookup "id (from ASBL)" (dans tes screenshots)
+ * - essaie linked "ASBL" (selon comment Airtable renvoie)
+ */
+function getAsblCodeFromRecordFields(fields = {}) {
+  if (typeof fields.asblId === 'string' && fields.asblId.trim()) return fields.asblId.trim();
+  if (typeof fields.asblCode === 'string' && fields.asblCode.trim()) return fields.asblCode.trim();
 
-  const all = [];
-  for (const c of chunks) {
-    const formula = `OR(${c.map((id) => `RECORD_ID()='${id}'`).join(',')})`;
-    const recs = await base(tableName).select({ filterByFormula: formula, maxRecords: 500 }).firstPage();
-    all.push(...recs);
-  }
+  const lookup = fields['id (from ASBL)'];
+  if (typeof lookup === 'string' && lookup.trim()) return lookup.trim();
+  if (Array.isArray(lookup) && typeof lookup[0] === 'string' && lookup[0].trim()) return lookup[0].trim();
 
-  return all.map((r) => ({ recordId: r.id, ...r.fields }));
+  // parfois Airtable renvoie le nom affiché du linked record dans un array
+  const linked = fields.ASBL;
+  if (typeof linked === 'string' && linked.trim()) return linked.trim();
+  if (Array.isArray(linked) && typeof linked[0] === 'string' && linked[0].trim()) return linked[0].trim();
+
+  return null;
 }
 
 /* ------------------------------------------------------------------ */
@@ -162,11 +167,9 @@ app.post('/api/auth/login', async (req, res) => {
     let asblId = null;
 
     if (type === 'admin') {
-      // admin record = ASBL record
       asblId = record.fields?.id || null;
       if (!asblId) return res.status(500).json({ error: "Champ ASBL 'id' manquant dans Airtable" });
     } else {
-      // benevole record = Benevoles record
       asblId = await getAsblCodeFromBenevoleRecord(record);
       if (!asblId) {
         return res.status(500).json({
@@ -344,14 +347,12 @@ app.post('/api/benevoles', verifyToken, requireRole(['admin', 'superadmin']), as
           role: role || 'both',
           tablesGerees: Array.isArray(tablesGerees) ? tablesGerees : [],
           asblId: finalAsblId,
-          // asbl: [asblRecord.id], // optionnel si tu as un champ linked-record
         },
       },
     ]);
 
     res.json({ recordId: created[0].id, ...created[0].fields });
   } catch (error) {
-    // ✅ IMPORTANT : on renvoie l’erreur Airtable complète (pour voir EXACTEMENT pourquoi ça échoue)
     console.error('POST /api/benevoles ERROR FULL:', error);
 
     return res.status(500).json({
@@ -367,56 +368,7 @@ app.post('/api/benevoles', verifyToken, requireRole(['admin', 'superadmin']), as
 });
 
 /* ------------------------------------------------------------------ */
-/* ✅ NEW : Participants (route querystring comme ton front)           */
-/* GET /api/participants?asblId=ASBL001                               */
-/* ------------------------------------------------------------------ */
-app.get('/api/participants', verifyToken, requireRole(['admin', 'benevole', 'superadmin']), async (req, res) => {
-  try {
-    const asblId = (req.query.asblId || '').toString().trim();
-    if (!asblId) return res.status(400).json({ error: 'asblId manquant' });
-    if (!canAccessAsbl(asblId, req)) return res.status(403).json({ error: 'Accès refusé (ASBL non autorisée)' });
-
-    // 1) On récupère l’ASBL et son champ "participants" (array de recordIds)
-    const asblRecord = await findAsblByBusinessId(asblId);
-    if (!asblRecord) return res.status(404).json({ error: 'ASBL introuvable' });
-
-    const participantIds = Array.isArray(asblRecord.fields?.participants) ? asblRecord.fields.participants : [];
-
-    // 2) On fetch les participants complets par recordIds
-    const participants = await fetchRecordsByIds('participants', participantIds);
-
-    res.json({ asblId, count: participants.length, participants });
-  } catch (e) {
-    console.error('GET /api/participants ERROR:', e);
-    res.status(500).json({ error: 'Erreur participants', details: e?.message || String(e) });
-  }
-});
-
-/* ------------------------------------------------------------------ */
-/* ✅ NEW : Reservations (route querystring comme ton front)           */
-/* GET /api/reservations?asblId=ASBL001                               */
-/* ------------------------------------------------------------------ */
-app.get('/api/reservations', verifyToken, requireRole(['admin', 'benevole', 'superadmin']), async (req, res) => {
-  try {
-    const asblId = (req.query.asblId || '').toString().trim();
-    if (!asblId) return res.status(400).json({ error: 'asblId manquant' });
-    if (!canAccessAsbl(asblId, req)) return res.status(403).json({ error: 'Accès refusé (ASBL non autorisée)' });
-
-    const asblRecord = await findAsblByBusinessId(asblId);
-    if (!asblRecord) return res.status(404).json({ error: 'ASBL introuvable' });
-
-    const reservationIds = Array.isArray(asblRecord.fields?.reservations) ? asblRecord.fields.reservations : [];
-    const reservations = await fetchRecordsByIds('Reservations', reservationIds);
-
-    res.json({ asblId, count: reservations.length, reservations });
-  } catch (e) {
-    console.error('GET /api/reservations ERROR:', e);
-    res.status(500).json({ error: 'Erreur reservations', details: e?.message || String(e) });
-  }
-});
-
-/* ------------------------------------------------------------------ */
-/* ✅ AJOUT : Réservations (admin/superadmin)                          */
+/* ✅ RÉSERVATIONS : support route /by-asbl + route ?asblId            */
 /* ------------------------------------------------------------------ */
 
 app.get('/api/reservations/by-asbl/:asblCode', verifyToken, requireRole(['admin', 'superadmin']), async (req, res) => {
@@ -435,6 +387,71 @@ app.get('/api/reservations/by-asbl/:asblCode', verifyToken, requireRole(['admin'
   } catch (e) {
     console.error('GET /api/reservations/by-asbl ERROR:', e);
     res.status(500).json({ error: 'Erreur réservations', details: e?.message || String(e) });
+  }
+});
+
+// ✅ pour ton front : /api/reservations?asblId=ASBL001
+app.get('/api/reservations', verifyToken, requireRole(['admin', 'superadmin']), async (req, res) => {
+  try {
+    const asblId = String(req.query.asblId || '').trim();
+    if (!asblId) return res.status(400).json({ error: 'asblId manquant (query)' });
+
+    if (req.user.type === 'admin' && req.user.asblId !== asblId) {
+      return res.status(403).json({ error: 'Accès refusé (ASBL non autorisée)' });
+    }
+
+    const all = await fetchAll('Reservations', 500);
+    const filtered = all.filter((x) => getAsblCodeFromRecordFields(x) === asblId);
+
+    // ✅ IMPORTANT : on renvoie un ARRAY (le front aime ça)
+    res.json(filtered);
+  } catch (e) {
+    console.error('GET /api/reservations ERROR:', e);
+    res.status(500).json({ error: 'Erreur réservations', details: e?.message || String(e) });
+  }
+});
+
+/* ------------------------------------------------------------------ */
+/* ✅ PARTICIPANTS : route ?asblId (celle que ton front appelle)       */
+/* ------------------------------------------------------------------ */
+
+// ✅ pour ton front : /api/participants?asblId=ASBL001
+app.get('/api/participants', verifyToken, requireRole(['admin', 'superadmin']), async (req, res) => {
+  try {
+    const asblId = String(req.query.asblId || '').trim();
+    if (!asblId) return res.status(400).json({ error: 'asblId manquant (query)' });
+
+    if (req.user.type === 'admin' && req.user.asblId !== asblId) {
+      return res.status(403).json({ error: 'Accès refusé (ASBL non autorisée)' });
+    }
+
+    const all = await fetchAll('participants', 500); // ⚠️ respecte exactement le nom de ta table Airtable ("participants")
+    const filtered = all.filter((x) => getAsblCodeFromRecordFields(x) === asblId);
+
+    // ✅ IMPORTANT : on renvoie un ARRAY, pas {participants:...}
+    res.json(filtered);
+  } catch (e) {
+    console.error('GET /api/participants ERROR:', e);
+    res.status(500).json({ error: 'Erreur participants', details: e?.message || String(e) });
+  }
+});
+
+// Optionnel (si tu veux aussi une route REST propre)
+app.get('/api/participants/by-asbl/:asblCode', verifyToken, requireRole(['admin', 'superadmin']), async (req, res) => {
+  try {
+    const asblCode = req.params.asblCode;
+
+    if (req.user.type === 'admin' && req.user.asblId !== asblCode) {
+      return res.status(403).json({ error: 'Accès refusé (ASBL non autorisée)' });
+    }
+
+    const all = await fetchAll('participants', 500);
+    const filtered = all.filter((x) => getAsblCodeFromRecordFields(x) === asblCode);
+
+    res.json(filtered);
+  } catch (e) {
+    console.error('GET /api/participants/by-asbl ERROR:', e);
+    res.status(500).json({ error: 'Erreur participants', details: e?.message || String(e) });
   }
 });
 

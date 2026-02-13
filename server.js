@@ -128,6 +128,61 @@ function getAsblCodeFromRecordFields(fields = {}) {
 }
 
 /* ------------------------------------------------------------------ */
+/* ✅ AJOUT : création automatique des tables                          */
+/* ------------------------------------------------------------------ */
+/**
+ * Crée les records dans Airtable table "Tables" à partir de:
+ * - asblId (ex: ASBL001)
+ * - maxParticipants (ex: 200)
+ * - peoplePerTable (ex: 10)
+ *
+ * ⚠️ Ne casse rien : si maxParticipants / peoplePerTable manquants => ne fait rien.
+ * ⚠️ Par défaut, on supprime les anciennes tables de l'ASBL avant de recréer (évite les doublons).
+ *     Si tu veux garder l'historique, dis-le et je change ce comportement.
+ */
+async function createTablesForAsbl({ asblId, maxParticipants, peoplePerTable }) {
+  const mp = Number(maxParticipants);
+  const ppt = Number(peoplePerTable);
+
+  if (!asblId || !mp || !ppt) {
+    return { created: 0, reason: "maxParticipants/peoplePerTable manquants ou invalides" };
+  }
+
+  const nbTables = Math.ceil(mp / ppt);
+
+  // Nettoyage des tables existantes pour cette ASBL (évite doublons)
+  const existing = await base('Tables')
+    .select({ filterByFormula: `{asblId} = '${asblId}'`, maxRecords: 500 })
+    .firstPage();
+
+  if (existing.length) {
+    await base('Tables').destroy(existing.map((r) => r.id));
+  }
+
+  const payload = Array.from({ length: nbTables }, (_, i) => {
+    const n = String(i + 1).padStart(3, '0');
+    return {
+      fields: {
+        id: `T${n}`,       // T001, T002...
+        asblId: asblId,    // ASBL001
+        capacite: ppt,     // 8/10/12
+        type: 'standard',  // optionnel
+      },
+    };
+  });
+
+  // Airtable: create par batch de 10
+  let created = 0;
+  for (let i = 0; i < payload.length; i += 10) {
+    const batch = payload.slice(i, i + 10);
+    const res = await base('Tables').create(batch);
+    created += res.length;
+  }
+
+  return { created, nbTables };
+}
+
+/* ------------------------------------------------------------------ */
 /* AUTH ROUTES                                                        */
 /* ------------------------------------------------------------------ */
 
@@ -225,7 +280,21 @@ app.get('/api/asbl', verifyToken, requireRole(['superadmin']), async (req, res) 
 
 app.post('/api/asbl', verifyToken, requireRole(['superadmin']), async (req, res) => {
   try {
-    const { id, nom, email, telephone, adminNom, adminPrenom, adminEmail, codeAdmin, actif, dateCreation } = req.body || {};
+    // ✅ AJOUT : maxParticipants + peoplePerTable (sans enlever le reste)
+    const {
+      id,
+      nom,
+      email,
+      telephone,
+      adminNom,
+      adminPrenom,
+      adminEmail,
+      codeAdmin,
+      actif,
+      dateCreation,
+      maxParticipants,
+      peoplePerTable,
+    } = req.body || {};
 
     if (!id || !nom || !email || !codeAdmin) {
       return res.status(400).json({ error: "Champs requis: id, nom, email, codeAdmin" });
@@ -247,9 +316,26 @@ app.post('/api/asbl', verifyToken, requireRole(['superadmin']), async (req, res)
           codeAdmin,
           actif: typeof actif === 'boolean' ? actif : true,
           dateCreation: dateCreation || nowISO(),
+
+          // ✅ AJOUT : on stocke ces infos dans Airtable si la table ASBL a ces champs
+          maxParticipants: Number(maxParticipants) || 0,
+          peoplePerTable: Number(peoplePerTable) || 0,
         },
       },
     ]);
+
+    // ✅ AJOUT : création automatique des tables dans Airtable "Tables"
+    // (si maxParticipants/peoplePerTable sont fournis)
+    try {
+      await createTablesForAsbl({
+        asblId: id,
+        maxParticipants,
+        peoplePerTable,
+      });
+    } catch (e) {
+      // ⚠️ Ne bloque pas la création ASBL si la création des tables échoue
+      console.error('CREATE TABLES AFTER ASBL ERROR:', e);
+    }
 
     res.json({ recordId: created[0].id, ...created[0].fields });
   } catch (error) {
@@ -287,6 +373,33 @@ app.get('/api/asbl/by-code/:code', verifyToken, requireRole(['admin', 'benevole'
   } catch (error) {
     console.error('GET /api/asbl/by-code ERROR:', error);
     res.status(500).json({ error: 'Erreur Airtable', details: error?.message || String(error) });
+  }
+});
+
+/* ------------------------------------------------------------------ */
+/* ✅ AJOUT : TABLES ROUTES                                            */
+/* ------------------------------------------------------------------ */
+/**
+ * Permet au front de récupérer les tables d'une ASBL:
+ * GET /api/tables?asblId=ASBL001
+ */
+app.get('/api/tables', verifyToken, requireRole(['admin', 'superadmin', 'benevole']), async (req, res) => {
+  try {
+    const asblId = String(req.query.asblId || '').trim();
+    if (!asblId) return res.status(400).json({ error: 'asblId manquant' });
+
+    if (req.user.type !== 'superadmin' && req.user.asblId !== asblId) {
+      return res.status(403).json({ error: 'Accès refusé (ASBL non autorisée)' });
+    }
+
+    const records = await base('Tables')
+      .select({ filterByFormula: `{asblId} = '${asblId}'`, maxRecords: 500 })
+      .firstPage();
+
+    res.json(records.map((r) => ({ recordId: r.id, ...r.fields })));
+  } catch (e) {
+    console.error('GET /api/tables ERROR:', e);
+    res.status(500).json({ error: 'Erreur tables', details: e?.message || String(e) });
   }
 });
 

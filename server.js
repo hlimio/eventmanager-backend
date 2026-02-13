@@ -128,6 +128,29 @@ function getAsblCodeFromRecordFields(fields = {}) {
 }
 
 /* ------------------------------------------------------------------ */
+/* ✅ AJOUT SAFE : normalisation peoplePerTable (single select 8/10/12)*/
+/* ------------------------------------------------------------------ */
+function normalizePeoplePerTable(value) {
+  if (value === null || value === undefined) return null;
+
+  // Si c'est déjà un nombre 8/10/12
+  if (typeof value === 'number') {
+    const v = String(value);
+    return ['8', '10', '12'].includes(v) ? v : null;
+  }
+
+  // Si c'est un texte du genre "10 personnes (Standard)"
+  const s = String(value).trim();
+
+  // Extrait le premier nombre trouvé
+  const m = s.match(/\d+/);
+  if (!m) return null;
+
+  const v = m[0]; // "10"
+  return ['8', '10', '12'].includes(v) ? v : null;
+}
+
+/* ------------------------------------------------------------------ */
 /* ✅ AJOUT : création automatique des tables                          */
 /* ------------------------------------------------------------------ */
 /**
@@ -138,11 +161,11 @@ function getAsblCodeFromRecordFields(fields = {}) {
  *
  * ⚠️ Ne casse rien : si maxParticipants / peoplePerTable manquants => ne fait rien.
  * ⚠️ Par défaut, on supprime les anciennes tables de l'ASBL avant de recréer (évite les doublons).
- *     Si tu veux garder l'historique, dis-le et je change ce comportement.
  */
 async function createTablesForAsbl({ asblId, maxParticipants, peoplePerTable }) {
   const mp = Number(maxParticipants);
-  const ppt = Number(peoplePerTable);
+  const pptNorm = normalizePeoplePerTable(peoplePerTable);
+  const ppt = pptNorm ? Number(pptNorm) : NaN;
 
   if (!asblId || !mp || !ppt) {
     return { created: 0, reason: "maxParticipants/peoplePerTable manquants ou invalides" };
@@ -163,10 +186,10 @@ async function createTablesForAsbl({ asblId, maxParticipants, peoplePerTable }) 
     const n = String(i + 1).padStart(3, '0');
     return {
       fields: {
-        id: `T${n}`,       // T001, T002...
-        asblId: asblId,    // ASBL001
-        capacite: ppt,     // 8/10/12
-        type: 'standard',  // optionnel
+        id: `T${n}`,      // T001, T002...
+        asblId: asblId,   // ASBL001
+        capacite: ppt,    // 8/10/12
+        type: 'standard', // optionnel
       },
     };
   });
@@ -303,34 +326,49 @@ app.post('/api/asbl', verifyToken, requireRole(['superadmin']), async (req, res)
     const existing = await findAsblByBusinessId(id);
     if (existing) return res.status(409).json({ error: `ASBL ${id} existe déjà` });
 
-    const created = await base('ASBL').create([
-      {
-        fields: {
-          id,
-          nom,
-          email,
-          telephone: telephone || '',
-          adminNom: adminNom || '',
-          adminPrenom: adminPrenom || '',
-          adminEmail: adminEmail || '',
-          codeAdmin,
-          actif: typeof actif === 'boolean' ? actif : true,
-          dateCreation: dateCreation || nowISO(),
+    // ✅ NORMALISATION : peoplePerTable doit être EXACTEMENT "8" / "10" / "12" pour Airtable (single select)
+    const pptNorm = normalizePeoplePerTable(peoplePerTable); // "8"|"10"|"12"|null
+    const mpNum = Number(maxParticipants);
 
-          // ✅ AJOUT : on stocke ces infos dans Airtable si la table ASBL a ces champs
-          maxParticipants: Number(maxParticipants) || 0,
-          peoplePerTable: Number(peoplePerTable) || 0,
-        },
-      },
-    ]);
+    // ⚠️ Construire fields sans casser l’ancien fonctionnement
+    const baseFields = {
+      id,
+      nom,
+      email,
+      telephone: telephone || '',
+      adminNom: adminNom || '',
+      adminPrenom: adminPrenom || '',
+      adminEmail: adminEmail || '',
+      codeAdmin,
+      actif: typeof actif === 'boolean' ? actif : true,
+      dateCreation: dateCreation || nowISO(),
+    };
 
-    // ✅ AJOUT : création automatique des tables dans Airtable "Tables"
-    // (si maxParticipants/peoplePerTable sont fournis)
+    // ✅ AJOUT (optionnel) : seulement si valeurs valides
+    const optionalFields = {};
+    if (!Number.isNaN(mpNum) && mpNum > 0) optionalFields.maxParticipants = mpNum;
+    if (pptNorm) optionalFields.peoplePerTable = pptNorm;
+
+    let created;
+    try {
+      // Tentative 1 : avec les champs optionnels
+      created = await base('ASBL').create([{ fields: { ...baseFields, ...optionalFields } }]);
+    } catch (err) {
+      // ✅ SAFE : si ta base n’a pas ces champs, on retente SANS (ne casse pas ton système)
+      if (err?.error === 'UNKNOWN_FIELD_NAME') {
+        console.warn('⚠️ ASBL optional fields unknown, retry without maxParticipants/peoplePerTable');
+        created = await base('ASBL').create([{ fields: { ...baseFields } }]);
+      } else {
+        throw err;
+      }
+    }
+
+    // ✅ AJOUT : création automatique des tables (si on a mp + ppt valides)
     try {
       await createTablesForAsbl({
         asblId: id,
-        maxParticipants,
-        peoplePerTable,
+        maxParticipants: mpNum,
+        peoplePerTable: pptNorm,
       });
     } catch (e) {
       // ⚠️ Ne bloque pas la création ASBL si la création des tables échoue
